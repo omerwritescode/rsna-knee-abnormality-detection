@@ -1,0 +1,111 @@
+"""Score labeler output against the human labels.
+
+    python -m src.labeler.evaluate data/labels/raw_v1_dev.jsonl --errors
+    python -m src.labeler.evaluate data/labels/raw_v1_heldout.jsonl
+
+Positive = score >= 0.5 (present or uncertain). Also shows the stricter
+"present only" sensitivity and the AUC of the soft score (1 / 0.5 / 0).
+`--errors` prints every disagreement with the model's evidence; it refuses on
+the held-out split unless you add --allow-heldout-errors (looking at those
+errors while still tuning the prompt turns held-out into a second dev set).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import cohen_kappa_score, roc_auc_score
+
+from .prompt import LABELS
+
+
+def load_jsonl(path: Path) -> pd.DataFrame:
+    rows = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("ok"):
+                rows[rec["StudyInstanceUID"]] = rec  # last one wins
+    return pd.DataFrame(rows.values())
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("jsonl", type=Path)
+    ap.add_argument("--root", type=Path, default=Path("."))
+    ap.add_argument("--errors", action="store_true")
+    ap.add_argument("--allow-heldout-errors", action="store_true")
+    ap.add_argument("--labels", nargs="*", default=None, help="limit --errors to these")
+    args = ap.parse_args()
+
+    recs = load_jsonl(args.jsonl)
+    train = pd.read_csv(args.root / "data" / "raw" / "train.csv")
+    split = pd.read_csv(args.root / "data" / "labels" / "split.csv")
+    truth = train.merge(split, on="StudyInstanceUID").set_index("StudyInstanceUID")
+    recs = recs[recs["StudyInstanceUID"].isin(truth.index)].set_index("StudyInstanceUID")
+    if recs.empty:
+        raise SystemExit("no labeled studies in this file")
+    splits = truth.loc[recs.index, "split"].unique().tolist()
+    print(f"{len(recs)} labeled studies scored · splits: {splits} · "
+          f"prompt {recs['prompt'].iloc[0]}\n")
+
+    S = pd.DataFrame(recs["scores"].tolist(), index=recs.index)[LABELS]
+    Y = truth.loc[recs.index, LABELS].astype(int)
+
+    rows = []
+    for lab in LABELS:
+        y, s = Y[lab].to_numpy(), S[lab].to_numpy()
+        p = (s >= 0.5).astype(int)
+        strict = (s >= 1.0).astype(int)
+        pos, neg = y == 1, y == 0
+        rows.append({
+            "label": lab,
+            "pos": int(pos.sum()),
+            "acc": (p == y).mean(),
+            "sens": p[pos].mean() if pos.any() else np.nan,
+            "sens_strict": strict[pos].mean() if pos.any() else np.nan,
+            "spec": 1 - p[neg].mean() if neg.any() else np.nan,
+            "kappa": cohen_kappa_score(y, p) if len(set(y)) > 1 or len(set(p)) > 1 else np.nan,
+            "auc_soft": roc_auc_score(y, s) if 0 < pos.sum() < len(y) else np.nan,
+            "n_unc": int((s == 0.5).sum()),
+        })
+    tab = pd.DataFrame(rows).set_index("label")
+    tab.loc["MACRO"] = tab.mean(numeric_only=True)
+    with pd.option_context("display.float_format", "{:.2f}".format):
+        print(tab.to_string())
+
+    tok = recs["eval_tokens"].dropna()
+    if len(tok):
+        print(f"\noutput tokens: mean {tok.mean():.0f}, max {tok.max():.0f} · "
+              f"seconds/report: mean {recs['seconds'].mean():.1f}")
+    if recs.get("truncated", pd.Series(False)).any():
+        print("WARNING: some outputs hit num_predict and were cut off")
+
+    if not args.errors:
+        return
+    if "heldout" in splits and not args.allow_heldout_errors:
+        raise SystemExit("\nrefusing --errors on held-out (see docstring)")
+    show = args.labels or LABELS
+    print("\n=== DISAGREEMENTS (FN = label 1, model missed · FP = label 0, model flagged)")
+    reports = train.set_index("StudyInstanceUID")["Report"]
+    for uid in recs.index:
+        bad = [(lab, Y.at[uid, lab], S.at[uid, lab]) for lab in show
+               if (S.at[uid, lab] >= 0.5) != bool(Y.at[uid, lab])]
+        if not bad:
+            continue
+        ev = {f["label"]: f"{f['status']}: {f['evidence']}" for f in recs.at[uid, "findings"]}
+        print(f"\n--- {uid[-8:]}")
+        for lab, y, s in bad:
+            kind = "FN" if y else "FP"
+            print(f"  {kind} {lab:<17} score={s:.1f}  {ev.get(lab, '(not listed)')}")
+        print("  report:", " ".join(str(reports[uid]).split())[:600], "...")
+
+
+if __name__ == "__main__":
+    main()

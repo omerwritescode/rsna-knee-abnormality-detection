@@ -1,0 +1,13 @@
+.kaggle/
+
+data/raw/
+data/shards/
+data/embeddings/
+data/download/
+data/labels/*.jsonl
+data/labels/*.log
+data/labels/*.parquet
+data/labels/*.txt
+__pycache__/
+*.zip
+.kaggle/
