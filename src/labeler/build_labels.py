@@ -15,6 +15,7 @@ import pandas as pd
 
 from .evaluate import load_jsonl
 from .prompt import LABELS
+from . import postprocess
 
 
 def main() -> None:
@@ -25,7 +26,10 @@ def main() -> None:
 
     train = pd.read_csv(args.root / "data" / "raw" / "train.csv")
     recs = load_jsonl(args.jsonl).set_index("StudyInstanceUID")
-    llm = pd.DataFrame(recs["scores"].tolist(), index=recs.index)[LABELS]
+    post = [postprocess.apply(sc, fi) for sc, fi in zip(recs["scores"], recs["findings"])]
+    llm = pd.DataFrame([p[0] for p in post], index=recs.index)[LABELS]
+    print(f"post-processing {postprocess.POST_VERSION}: changed "
+          f"{sum(bool(p[1]) for p in post)} studies")
 
     out = train[["StudyInstanceUID"]].set_index("StudyInstanceUID")
     out = out.join(llm)
@@ -36,6 +40,7 @@ def main() -> None:
     out.loc[human.index, LABELS] = human.astype(float)
     out.loc[human.index, "source"] = "human"
     out["prompt"] = recs["prompt"].reindex(out.index)
+    out["post"] = postprocess.POST_VERSION
 
     path = args.root / "data" / "labels" / "soft_labels.parquet"
     out.reset_index().to_parquet(path, index=False)

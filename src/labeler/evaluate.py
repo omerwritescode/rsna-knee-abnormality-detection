@@ -22,6 +22,7 @@ from sklearn.metrics import cohen_kappa_score, roc_auc_score
 
 from .prompt import LABELS
 from .run import normalise
+from . import postprocess
 
 
 class Tee:
@@ -60,6 +61,7 @@ def main() -> None:
     ap.add_argument("--errors", action="store_true")
     ap.add_argument("--allow-heldout-errors", action="store_true")
     ap.add_argument("--labels", nargs="*", default=None, help="limit --errors to these")
+    ap.add_argument("--no-post", action="store_true", help="skip postprocess rules")
     ap.add_argument("--save", type=Path, default=None,
                     help="also write the output to this file (UTF-8)")
     args = ap.parse_args()
@@ -78,7 +80,15 @@ def main() -> None:
     print(f"{len(recs)} labeled studies scored · splits: {splits} · "
           f"prompt {recs['prompt'].iloc[0]}\n")
 
-    S = pd.DataFrame(recs["scores"].tolist(), index=recs.index)[LABELS]
+    if args.no_post:
+        S = pd.DataFrame(recs["scores"].tolist(), index=recs.index)[LABELS]
+        print("post-processing: OFF\n")
+    else:
+        post = [postprocess.apply(sc, fi) for sc, fi in zip(recs["scores"], recs["findings"])]
+        S = pd.DataFrame([p[0] for p in post], index=recs.index)[LABELS]
+        n_fired = sum(bool(p[1]) for p in post)
+        print(f"post-processing {postprocess.POST_VERSION}: changed {n_fired} studies "
+              f"(use --no-post to see raw model scores)\n")
     Y = truth.loc[recs.index, LABELS].astype(int)
 
     rows = []

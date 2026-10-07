@@ -22,7 +22,13 @@ python -m src.labeler.run --subset all
 python -m src.labeler.build_labels data\labels\raw_v3_all.jsonl
 ```
 
-### Running 2 reports in parallel (faster full run)
+### Post-processing
+`postprocess.py` applies fixed rules on top of the model's scores whenever a JSONL is
+read (evaluate, build_labels); the JSONL itself is never changed. Rule p1: Synovitis
+absent + moderate/large effusion or hemarthrosis in the Effusion quote -> 0.5.
+`evaluate.py --no-post` shows the raw model scores.
+
+### Running 2 reports in parallel (tested 7 Oct: no gain on the RTX 5050)
 
 Ollama handles one request at a time unless told otherwise. To allow 2:
 ```powershell
@@ -39,6 +45,7 @@ Results are identical either way; only the speed changes.
 | `prompt.py` | System prompt, label definitions, JSON schema passed to Ollama `format`, `PROMPT_VERSION` |
 | `run.py` | Ollama runner: `think: false`, temp 0, `num_ctx` 8192, schema-constrained output, 3 retries, resumable JSONL + log |
 | `evaluate.py` | Per-label acc / sens / spec / κ / soft AUC vs the human labels; `--errors` lists disagreements (dev only) |
+| `postprocess.py` | Deterministic rules on top of the model scores (Synovitis from effusion size) |
 | `build_labels.py` | `soft_labels.parquet`: 58 human labels + LLM 1 / 0.5 / 0, with a `source` column |
 
 Outputs go to `data\labels\` as `raw_<version>_<subset>.jsonl` and `run_<version>_<subset>.log`.
