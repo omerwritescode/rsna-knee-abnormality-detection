@@ -1,6 +1,7 @@
 """Label knee MRI reports with a local Ollama model. Resumable.
 
 Usage (from the project root, venv active, Ollama running):
+    python -m src.labeler.run --subset dev --workers 2    # 2 in parallel (see README)
     python -m src.labeler.run --subset dev                 # iterate on the prompt
     python -m src.labeler.run --subset heldout             # score once definitions are frozen
     python -m src.labeler.run --subset all                 # overnight full run (4,407)
@@ -14,7 +15,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -62,6 +65,11 @@ def to_scores(findings) -> tuple[dict[str, float], list[str]]:
         if st not in STATUS_VALUE:
             problems.append(f"unknown status {st!r} for {lab}")
             continue
+        if not str((f or {}).get("q", "")).strip() and STATUS_VALUE[st] > 0:
+            # v2 showed "uncertain" with an empty quote on normal reports: a
+            # finding with nothing quoted from the report counts as absent.
+            problems.append(f"{lab}: {st} with empty quote -> absent")
+            continue
         scores[lab] = max(scores[lab], STATUS_VALUE[st])
     return scores, problems
 
@@ -83,6 +91,45 @@ def call_ollama(session: requests.Session, model: str, report: str,
     r = session.post(OLLAMA_URL, json=payload, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+_local = threading.local()
+
+
+def label_one(uid: str, report: str, model: str, timeout: float,
+              log: logging.Logger) -> dict:
+    """Label one report with up to 3 attempts. Returns the JSONL record."""
+    if not hasattr(_local, "session"):
+        _local.session = requests.Session()  # one HTTP session per thread
+    rec = {"StudyInstanceUID": uid, "prompt": PROMPT_VERSION, "model": model, "ok": False}
+    for attempt in range(3):
+        t0 = time.time()
+        try:
+            resp = call_ollama(_local.session, model, report, timeout)
+            findings = json.loads(resp["message"]["content"])
+            if not isinstance(findings, dict):
+                raise TypeError(f"expected a JSON object, got {type(findings).__name__}")
+            findings = findings.get("findings", findings)  # v1 wrapper
+            scores, problems = to_scores(findings)
+            ns = 1e9  # Ollama reports durations in nanoseconds
+            rec.update(ok=True, findings=findings, scores=scores, problems=problems,
+                       eval_tokens=resp.get("eval_count"),
+                       prompt_tokens=resp.get("prompt_eval_count"),
+                       gen_s=round(resp.get("eval_duration", 0) / ns, 2),
+                       prompt_s=round(resp.get("prompt_eval_duration", 0) / ns, 2),
+                       load_s=round(resp.get("load_duration", 0) / ns, 2),
+                       seconds=round(time.time() - t0, 2),
+                       truncated=resp.get("done_reason") == "length")
+            rec.pop("error", None)
+            real = [pr for pr in problems if pr.startswith("unknown")]
+            if real:  # empty-quote corrections are expected; don't log those
+                log.warning("%s: %s", uid, "; ".join(real))
+            return rec
+        except (requests.RequestException, KeyError, json.JSONDecodeError, TypeError) as e:
+            rec["error"] = f"{type(e).__name__}: {e}"[:300]
+            log.warning("%s attempt %d failed: %s", uid, attempt + 1, rec["error"])
+            time.sleep(5 * (attempt + 1))
+    return rec
 
 
 def select(df: pd.DataFrame, split_path: Path, subset: str) -> pd.DataFrame:
@@ -110,6 +157,8 @@ def main() -> None:
     ap.add_argument("--redo", action="store_true", help="overwrite the output file")
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--tag", default="", help="extra suffix for the output name")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel requests; needs OLLAMA_NUM_PARALLEL set to the same")
     args = ap.parse_args()
 
     labels_dir = args.root / "data" / "labels"
@@ -152,53 +201,29 @@ def main() -> None:
     log.info("prompt=%s model=%s subset=%s: %d already done, %d to do -> %s",
              PROMPT_VERSION, args.model, args.subset, len(done), len(todo), out_path)
 
-    session = requests.Session()
+    workers = max(1, args.workers)
+    if workers > 1:
+        log.info("workers=%d: Ollama must be started with OLLAMA_NUM_PARALLEL>=%d, "
+                 "otherwise requests just queue", workers, workers)
     t_start, n_ok, n_fail = time.time(), 0, 0
-    with open(out_path, "a", encoding="utf-8") as out:
-        for i, row in enumerate(todo.itertuples(index=False), 1):
-            uid, report = row.StudyInstanceUID, row.Report
-            rec = {"StudyInstanceUID": uid, "prompt": PROMPT_VERSION,
-                   "model": args.model, "ok": False}
-            for attempt in range(3):
-                t0 = time.time()
-                try:
-                    resp = call_ollama(session, args.model, report, args.timeout)
-                    raw = resp["message"]["content"]
-                    findings = json.loads(raw)
-                    if not isinstance(findings, dict):
-                        raise TypeError(f"expected a JSON object, got {type(findings).__name__}")
-                    findings = findings.get("findings", findings)  # v1 wrapper
-                    scores, problems = to_scores(findings)
-                    ns = 1e9  # Ollama reports durations in nanoseconds
-                    rec.update(ok=True, findings=findings, scores=scores,
-                               problems=problems,
-                               eval_tokens=resp.get("eval_count"),
-                               prompt_tokens=resp.get("prompt_eval_count"),
-                               gen_s=round(resp.get("eval_duration", 0) / ns, 2),
-                               prompt_s=round(resp.get("prompt_eval_duration", 0) / ns, 2),
-                               load_s=round(resp.get("load_duration", 0) / ns, 2),
-                               seconds=round(time.time() - t0, 2),
-                               truncated=resp.get("done_reason") == "length")
-                    if problems:
-                        log.warning("%s: %s", uid, "; ".join(problems))
-                    break
-                except (requests.RequestException, KeyError,
-                        json.JSONDecodeError, TypeError) as e:
-                    rec["error"] = f"{type(e).__name__}: {e}"[:300]
-                    log.warning("%s attempt %d failed: %s", uid, attempt + 1, rec["error"])
-                    time.sleep(5 * (attempt + 1))
+    rows = list(todo[["StudyInstanceUID", "Report"]].itertuples(index=False, name=None))
+    with open(out_path, "a", encoding="utf-8") as out, \
+            ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(label_one, uid, rep, args.model, args.timeout, log)
+                   for uid, rep in rows]
+        for i, fut in enumerate(as_completed(futures), 1):
+            rec = fut.result()
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out.flush()
             n_ok += rec["ok"]
             n_fail += not rec["ok"]
-            if i % 25 == 0 or i == len(todo):
+            if i % 25 == 0 or i == len(rows):
                 el = time.time() - t_start
-                eta = el / i * (len(todo) - i)
+                eta = el / i * (len(rows) - i)
                 log.info("%d/%d  ok=%d fail=%d  %.1f s/report  ETA %.1f h",
-                         i, len(todo), n_ok, n_fail, el / i, eta / 3600)
+                         i, len(rows), n_ok, n_fail, el / i, eta / 3600)
     log.info("finished: ok=%d fail=%d (failed studies are retried on the next run)",
              n_ok, n_fail)
-
 
 if __name__ == "__main__":
     main()
