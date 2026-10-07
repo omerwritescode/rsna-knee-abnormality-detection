@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,23 @@ import pandas as pd
 from sklearn.metrics import cohen_kappa_score, roc_auc_score
 
 from .prompt import LABELS
+from .run import normalise
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for st in self.streams:
+            try:
+                st.write(text)
+            except UnicodeEncodeError:
+                st.write(text.encode("ascii", "replace").decode())
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
 
 
 def load_jsonl(path: Path) -> pd.DataFrame:
@@ -42,7 +60,12 @@ def main() -> None:
     ap.add_argument("--errors", action="store_true")
     ap.add_argument("--allow-heldout-errors", action="store_true")
     ap.add_argument("--labels", nargs="*", default=None, help="limit --errors to these")
+    ap.add_argument("--save", type=Path, default=None,
+                    help="also write the output to this file (UTF-8)")
     args = ap.parse_args()
+    if args.save:
+        # PowerShell's Out-File re-encodes non-Latin text badly; write it ourselves
+        sys.stdout = Tee(sys.stdout, open(args.save, "w", encoding="utf-8"))
 
     recs = load_jsonl(args.jsonl)
     train = pd.read_csv(args.root / "data" / "raw" / "train.csv")
@@ -84,6 +107,10 @@ def main() -> None:
     if len(tok):
         print(f"\noutput tokens: mean {tok.mean():.0f}, max {tok.max():.0f} · "
               f"seconds/report: mean {recs['seconds'].mean():.1f}")
+    if "gen_s" in recs:
+        t = recs[["prompt_tokens", "prompt_s", "eval_tokens", "gen_s", "load_s"]].mean()
+        print(f"per report: prompt {t.prompt_tokens:.0f} tok in {t.prompt_s:.2f}s · "
+              f"output {t.eval_tokens:.0f} tok in {t.gen_s:.2f}s · load {t.load_s:.2f}s")
     if recs.get("truncated", pd.Series(False)).any():
         print("WARNING: some outputs hit num_predict and were cut off")
 
@@ -99,7 +126,8 @@ def main() -> None:
                if (S.at[uid, lab] >= 0.5) != bool(Y.at[uid, lab])]
         if not bad:
             continue
-        ev = {f["label"]: f"{f['status']}: {f['evidence']}" for f in recs.at[uid, "findings"]}
+        ev = {lab: f"{f.get('s')}: {f.get('q', '')}"
+              for lab, f in normalise(recs.at[uid, "findings"]).items()}
         print(f"\n--- {uid[-8:]}")
         for lab, y, s in bad:
             kind = "FN" if y else "FP"

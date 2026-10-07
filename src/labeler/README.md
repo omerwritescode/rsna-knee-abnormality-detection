@@ -11,15 +11,15 @@ python -m src.labeler.split
 
 # 2. Dev loop: run, read errors, edit prompt.py (bump PROMPT_VERSION), repeat
 python -m src.labeler.run --subset dev
-python -m src.labeler.evaluate data\labels\raw_v1_dev.jsonl --errors
+python -m src.labeler.evaluate data\labels\raw_v2_dev.jsonl --errors --save data\labels\eval_v2_dev.txt
 
 # 3. Once definitions are frozen: score the held-out 38 (summary only)
 python -m src.labeler.run --subset heldout
-python -m src.labeler.evaluate data\labels\raw_v1_heldout.jsonl
+python -m src.labeler.evaluate data\labels\raw_v2_heldout.jsonl
 
 # 4. Overnight full run in its own window (resumable; just rerun if it stops)
 python -m src.labeler.run --subset all
-python -m src.labeler.build_labels data\labels\raw_v1_all.jsonl
+python -m src.labeler.build_labels data\labels\raw_v2_all.jsonl
 ```
 
 | File | What it does |

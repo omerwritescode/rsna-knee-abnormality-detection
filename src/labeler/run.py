@@ -27,25 +27,42 @@ DEFAULT_MODEL = "qwen3.5:9b"
 OPTIONS = {
     "temperature": 0,
     "num_ctx": 8192,       # default 4096 is too small for prompt + long report
-    "num_predict": 600,    # hard cap; a normal answer is 50-250 tokens
+    "num_predict": 800,    # hard cap; a v2 answer is ~150-350 tokens
     "seed": 0,
 }
 
 
-def to_scores(findings: list[dict]) -> tuple[dict[str, float], list[str]]:
-    """Findings list -> 12 soft labels (present 1, uncertain 0.5, missing 0)."""
+STATUS_VALUE = {"present": 1.0, "uncertain": 0.5, "absent": 0.0}
+
+
+def normalise(findings) -> dict[str, dict]:
+    """Return {label: {"q": quote, "s": status}} for both output formats.
+
+    v2+: a dict keyed by label. v1: a list of {"label", "status", "evidence"}.
+    """
+    if isinstance(findings, dict):
+        return findings
+    out = {}
+    for f in findings:
+        lab = f.get("label")
+        if lab is not None:
+            out[lab] = {"q": f.get("evidence", ""), "s": f.get("status")}
+    return out
+
+
+def to_scores(findings) -> tuple[dict[str, float], list[str]]:
+    """Model output -> 12 soft labels (present 1, uncertain 0.5, absent/missing 0)."""
     scores = {lab: 0.0 for lab in LABELS}
     problems = []
-    for f in findings:
-        lab, st = f.get("label"), f.get("status")
+    for lab, f in normalise(findings).items():
         if lab not in scores:
             problems.append(f"unknown label {lab!r}")
             continue
-        val = {"present": 1.0, "uncertain": 0.5}.get(st)
-        if val is None:
+        st = (f or {}).get("s")
+        if st not in STATUS_VALUE:
             problems.append(f"unknown status {st!r} for {lab}")
             continue
-        scores[lab] = max(scores[lab], val)
+        scores[lab] = max(scores[lab], STATUS_VALUE[st])
     return scores, problems
 
 
@@ -147,12 +164,19 @@ def main() -> None:
                 try:
                     resp = call_ollama(session, args.model, report, args.timeout)
                     raw = resp["message"]["content"]
-                    findings = json.loads(raw)["findings"]
+                    findings = json.loads(raw)
+                    if not isinstance(findings, dict):
+                        raise TypeError(f"expected a JSON object, got {type(findings).__name__}")
+                    findings = findings.get("findings", findings)  # v1 wrapper
                     scores, problems = to_scores(findings)
+                    ns = 1e9  # Ollama reports durations in nanoseconds
                     rec.update(ok=True, findings=findings, scores=scores,
                                problems=problems,
                                eval_tokens=resp.get("eval_count"),
                                prompt_tokens=resp.get("prompt_eval_count"),
+                               gen_s=round(resp.get("eval_duration", 0) / ns, 2),
+                               prompt_s=round(resp.get("prompt_eval_duration", 0) / ns, 2),
+                               load_s=round(resp.get("load_duration", 0) / ns, 2),
                                seconds=round(time.time() - t0, 2),
                                truncated=resp.get("done_reason") == "length")
                     if problems:
