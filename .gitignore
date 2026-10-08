@@ -11,3 +11,5 @@ data/labels/*.txt
 __pycache__/
 *.zip
 .kaggle/
+
+runs/
