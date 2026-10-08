@@ -1,8 +1,9 @@
 """Inference: study DICOMs -> 12 probabilities. Shared by the Kaggle submission notebook
 and a local parity check.
 
-Local check (laptop, before uploading anything):
-    python -m src.models.predict --check --run v2
+Local checks (laptop, before uploading anything):
+    python -m src.models.predict --check --run v2        # M1 feature parity
+    python -m src.models.predict --check-m2 ft1          # M2 inference vs training OOF
   re-embeds a few training shards with the same Embedder, compares the features with the
   training cache, and checks the fold ensemble gives the same predictions from both.
 
@@ -82,6 +83,62 @@ class Ensemble:
         return np.mean(preds, 0)
 
 
+class M2Ensemble:
+    """All fold checkpoints of one M2 run. The frozen DINOv2 blocks are identical in every
+    fold, so they run once per image and only the trained blocks + head run per fold."""
+
+    def __init__(self, ckpt_paths, weights: str | None = None, device=None):
+        import torch
+
+        from .m1 import M1
+        from .m2 import M2
+        self.torch = torch
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.models = []
+        for p in sorted(ckpt_paths):
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            cfg, cfg1 = ck["config"], ck["m1_config"]
+            head = M1(cfg1["in_dim"], cfg1["d"], cfg1["layers"], cfg1["heads"], cfg["drop"])
+            stats = {k: v.numpy() for k, v in ck["stats"].items()}
+            m = M2(head, stats, cfg["backbone"], cfg["img_size"], 2, cfg["frozen_blocks"], weights)
+            m.load_state_dict(ck["state_dict"])
+            self.models.append(m.eval().to(self.device))
+        if not self.models:
+            raise FileNotFoundError("no M2 fold*.pt checkpoints given")
+        self.shared = all(self._same_frozen(self.models[0], m) for m in self.models[1:])
+
+    def _same_frozen(self, a, b) -> bool:
+        if a.frozen_blocks != b.frozen_blocks:
+            return False
+        trained = tuple(f"backbone.blocks.{i}." for i in range(a.frozen_blocks, len(a.backbone.blocks)))
+        sa, sb = a.state_dict(), b.state_dict()
+        keys = [k for k in sa if k.startswith("backbone.") and not k.startswith(trained)
+                and not k.startswith("backbone.norm.")]
+        return all(self.torch.equal(sa[k], sb[k]) for k in keys)
+
+    def predict_arrays(self, arrays: dict, share: bool | None = None) -> np.ndarray | None:
+        """kneeprep arrays -> [12] probabilities (folds x {normal, mirrored} averaged)."""
+        from .data import sample_study
+        torch, dev = self.torch, self.device
+        share = self.shared if share is None else share
+        out = []
+        with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16,
+                                             enabled=dev.type == "cuda"):
+            for mirror in (False, True):
+                vol, present, idx = sample_study(arrays, False, mirror=mirror)
+                if not present.any():
+                    return None
+                pr = torch.from_numpy(present).to(dev)
+                imgs = torch.from_numpy(vol).to(dev)[pr].reshape(-1, vol.shape[-2], vol.shape[-1])
+                pos = torch.from_numpy(idx)[None].to(dev)
+                x = self.models[0].stem(imgs) if share else None
+                for m in self.models:
+                    feats = m.tail(x if share else m.stem(imgs))
+                    logit = m.head_from_features(feats, pr[None], pos)
+                    out.append(torch.sigmoid(logit.float())[0].cpu().numpy())
+        return np.mean(out, 0)
+
+
 # ----------------------------------------------------------------------------- Kaggle run
 def prep_task(task):
     """Pool worker: (index, study_dir, series rows) -> (index, arrays | None, message)."""
@@ -129,25 +186,49 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
     weights = next(model_dir.rglob("model.safetensors"), None)
     if weights is None:
         log("WARNING: no model.safetensors in the model dataset - timm will try to download")
-    embedder = Embedder(weights=str(weights) if weights else None)
-    ens = Ensemble(list(model_dir.rglob("fold*.pt")), embedder.device)
-    g_out = int(ens.cfg.get("cache", "cache_g2").split("_g")[-1])
-    log(f"models ready: {len(ens.models)} folds, grid {g_out}, device {embedder.device} "
-        f"({time.time() - t0:.0f}s)")
+    weights = str(weights) if weights else None
+    ckpts = list(model_dir.rglob("fold*.pt"))
+    m1_paths = [p for p in ckpts if p.parent.name == "m1"]
+    m2_paths = [p for p in ckpts if p.parent.name == "m2"]
+    blend_file = next(model_dir.rglob("blend.json"), None)
+    w = json.loads(blend_file.read_text()) if blend_file else {"m1": 0.3, "m2": 0.7}
+    use_m1 = bool(m1_paths) and w.get("m1", 0) > 0
+    use_m2 = bool(m2_paths) and w.get("m2", 0) > 0
+    if not (use_m1 or use_m2):
+        raise FileNotFoundError(f"no usable checkpoints (m1: {len(m1_paths)}, m2: {len(m2_paths)})")
+    embedder = ens = m2ens = None
+    g_out = 2
+    if use_m1:
+        embedder = Embedder(weights=weights)
+        ens = Ensemble(m1_paths, embedder.device)
+        g_out = int(ens.cfg.get("cache", "cache_g2").split("_g")[-1])
+    if use_m2:
+        m2ens = M2Ensemble(m2_paths, weights)
+    log(f"models ready: M1 {len(m1_paths) if use_m1 else 0} folds (w={w.get('m1', 0) if use_m1 else 0}), "
+        f"M2 {len(m2_paths) if use_m2 else 0} folds (w={w.get('m2', 0) if use_m2 else 0}"
+        f"{', shared frozen stem' if use_m2 and m2ens.shared else ''}) ({time.time() - t0:.0f}s)")
 
     n = len(ids)
     feats = np.zeros((n, N_SLOTS, N_SLICES, FEAT_DIM), np.float16)
     grid = np.zeros((n, N_SLOTS, N_SLICES, g_out * g_out, PATCH_DIM), np.float16)
     present = np.zeros((n, N_SLOTS), bool)
+    pred_m2 = np.full((n, len(LABELS)), np.nan)
     problems, timed_out = {}, False
     for k, (i, arrays, msg) in enumerate(results, 1):
         if msg:
             problems[ids[i]] = msg
-        if arrays:
+        if arrays and use_m1:
             try:
                 feats[i], grid[i], present[i] = study_tensors(arrays, embedder, g_out)
             except Exception as e:  # noqa: BLE001
-                problems[ids[i]] = f"embed {type(e).__name__}: {e}"[:300]
+                problems[ids[i]] = f"M1 {type(e).__name__}: {e}"[:300]
+        if arrays and use_m2:
+            try:
+                p2 = m2ens.predict_arrays(arrays)
+                if p2 is not None:
+                    pred_m2[i] = p2
+            except Exception as e:  # noqa: BLE001
+                problems[ids[i]] = f"M2 {type(e).__name__}: {e}"[:300]
         el = time.time() - t0
         if k % 50 == 0 or k == n:
             log(f"  {k}/{n} studies  {el / k:.2f} s/study  elapsed {el / 60:.1f} min  "
@@ -158,10 +239,21 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
             break
     pool.terminate()
 
-    ok = present.any(1)
+    pred_m1 = np.full((n, len(LABELS)), np.nan)
+    ok1 = present.any(1)
+    if use_m1 and ok1.any():
+        pred_m1[ok1] = ens.predict(feats[ok1], grid[ok1], present[ok1])
+    num = np.zeros((n, len(LABELS)))
+    den = np.zeros(n)
+    for p_, wt, used in ((pred_m1, w.get("m1", 0), use_m1), (pred_m2, w.get("m2", 0), use_m2)):
+        if not used:
+            continue
+        valid = ~np.isnan(p_).any(1)
+        num[valid] += wt * p_[valid]
+        den[valid] += wt
+    ok = den > 0
     pred = np.tile(np.array([priors[lab] for lab in LABELS], float), (n, 1))
-    if ok.any():
-        pred[ok] = ens.predict(feats[ok], grid[ok], present[ok])
+    pred[ok] = num[ok] / den[ok, None]
     sub = pd.DataFrame(pred, columns=LABELS)
     sub.insert(0, "StudyInstanceUID", ids)
     sub = sub[sample.columns.tolist()]
@@ -169,7 +261,10 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
 
     log(f"\npredicted {ok.sum()}/{n} studies from images, {n - ok.sum()} got priors"
         f"{' (time limit)' if timed_out else ''} | total {(time.time() - t0) / 60:.1f} min")
-    log("series kinds present: " + str(dict(zip(SLOTS, present.sum(0).tolist()))))
+    if use_m1:
+        log("M1 series kinds present: " + str(dict(zip(SLOTS, present.sum(0).tolist()))))
+    if use_m2:
+        log(f"M2 predicted {int((~np.isnan(pred_m2).any(1)).sum())} studies")
     for sid, msg in list(problems.items())[:20]:
         log(f"  note {sid[-12:]}: {msg}")
     if len(problems) > 20:
@@ -214,6 +309,37 @@ def local_check(root: Path, run: str, tag: str, cache_name: str, n: int) -> None
     print("PARITY CHECK", "PASSED" if ok else "FAILED - send this output")
 
 
+def local_check_m2(root: Path, run: str, n: int) -> None:
+    """Re-predict the first n validation studies of fold 0 with the inference path and
+    compare with the training-time out-of-fold predictions."""
+    import pandas as pd
+    run_dir = root / "runs" / "m2" / run
+    oof = pd.read_csv(run_dir / "oof_fold0.csv", dtype={"StudyInstanceUID": str}).head(n)
+    t0 = time.time()
+    ens = M2Ensemble([run_dir / "fold0.pt"])
+    print(f"loaded fold 0 in {time.time() - t0:.1f}s on {ens.device}")
+    t0 = time.time()
+    preds = []
+    for u in oof["StudyInstanceUID"]:
+        with np.load(root / "data" / "shards" / f"{u}.npz") as z:
+            preds.append(ens.predict_arrays({k: z[k] for k in z.files}))
+    preds = np.array(preds)
+    diff = np.abs(preds - oof[LABELS].to_numpy()).max()
+    print(f"{n} studies in {time.time() - t0:.1f}s ({(time.time() - t0) / n:.2f} s/study, 1 fold)")
+    print(f"max |inference - training OOF| = {diff:.4f}   [expect < 0.02: fp16 vs bf16]")
+    folds = sorted(run_dir.glob("fold*.pt"))
+    shared_ok = True
+    if len(folds) > 1:
+        ens2 = M2Ensemble(folds[:2])
+        with np.load(root / "data" / "shards" / f"{oof['StudyInstanceUID'][0]}.npz") as z:
+            arrays = {k: z[k] for k in z.files}
+        a, b = ens2.predict_arrays(arrays, share=True), ens2.predict_arrays(arrays, share=False)
+        shared_ok = ens2.shared and np.abs(a - b).max() < 1e-3
+        print(f"frozen stem identical across folds: {ens2.shared} | shared vs separate "
+              f"max diff {np.abs(a - b).max():.6f}")
+    print("M2 CHECK", "PASSED" if diff < 0.02 and shared_ok else "FAILED - send this output")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, default=Path("."))
@@ -222,10 +348,14 @@ def main() -> None:
     ap.add_argument("--tag", default="dinov2s_224_g4")
     ap.add_argument("--cache", default="cache_g2")
     ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--check-m2", default=None, metavar="RUN", help="check an M2 run, e.g. ft1")
     args = ap.parse_args()
-    if not args.check:
-        raise SystemExit("use --check locally; run_test() is called from the Kaggle notebook")
-    local_check(args.root, args.run, args.tag, args.cache, args.n)
+    if args.check_m2:
+        local_check_m2(args.root, args.check_m2, args.n)
+    elif args.check:
+        local_check(args.root, args.run, args.tag, args.cache, args.n)
+    else:
+        raise SystemExit("use --check or --check-m2 locally; run_test() runs in the Kaggle notebook")
 
 
 if __name__ == "__main__":

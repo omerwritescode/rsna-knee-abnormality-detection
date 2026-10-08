@@ -1,9 +1,11 @@
 """Collect everything the internet-off submission notebook needs into one Kaggle dataset.
 
-    python scripts/make_model_dataset.py --run v2
+    python scripts/make_model_dataset.py --run v2                 # M1 only
+    python scripts/make_model_dataset.py --run v2 --m2-run ft1    # M1 + M2 (+ blend.json)
 
 Creates kaggle/model_dataset/ with
     m1/fold*.pt (+ config.json, metrics.csv)   the M1 run's fold checkpoints
+    m2/fold*.pt (+ blend.json)                 the M2 run's fold checkpoints (optional)
     dinov2/model.safetensors                   DINOv2-S weights (from the local HF cache)
     priors.json                                per-label prevalence, used if a study fails
     wheels/                                    pydicom + JPEG/JPEG2000 decoders for Linux
@@ -50,6 +52,7 @@ def download_wheels(dest: Path, py: str) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="v2", help="runs/m1/<run>")
+    ap.add_argument("--m2-run", default=None, help="runs/m2/<run> (optional)")
     ap.add_argument("--out", type=Path, default=ROOT / "kaggle" / "model_dataset")
     ap.add_argument("--user", default="omerraza2202")
     ap.add_argument("--slug", default="rsna-knee-models")
@@ -69,6 +72,28 @@ def main() -> None:
         if f.exists():
             shutil.copy2(f, out / "m1" / f.name)
     print(f"M1 run '{args.run}': {len(folds)} folds copied")
+
+    m2_dir = out / "m2"
+    if m2_dir.exists():
+        for old in m2_dir.glob("*"):
+            old.unlink()
+    if args.m2_run:
+        run2 = ROOT / "runs" / "m2" / args.m2_run
+        folds2 = sorted(run2.glob("fold*.pt"))
+        if not folds2:
+            raise SystemExit(f"no fold*.pt in {run2}")
+        m2_dir.mkdir(exist_ok=True)
+        for f in [*folds2, run2 / "config.json", run2 / "blend.json"]:
+            if f.exists():
+                shutil.copy2(f, m2_dir / f.name)
+        blend = json.loads((run2 / "blend.json").read_text()) if (run2 / "blend.json").exists() \
+            else {"m1": 0.3, "m2": 0.7}
+        if not (run2 / "blend.json").exists():
+            (m2_dir / "blend.json").write_text(json.dumps(blend, indent=2))
+            print("WARNING: no blend.json from src.models.blend - using M1 0.3 / M2 0.7")
+        print(f"M2 run '{args.m2_run}': {len(folds2)} folds copied, blend {blend}")
+        if len(folds2) < 5:
+            print(f"WARNING: only {len(folds2)} M2 folds")
 
     (out / "dinov2").mkdir(exist_ok=True)
     src = dinov2_weights()

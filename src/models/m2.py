@@ -88,8 +88,9 @@ class M2(nn.Module):
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
 
-    def slice_features(self, img: torch.Tensor) -> torch.Tensor:
-        """uint8 [N,256,256] -> standardised [N, 768 + g*g*384] (same definition as M1)."""
+    def stem(self, img: torch.Tensor) -> torch.Tensor:
+        """uint8 [N,256,256] -> tokens after the FROZEN blocks (no gradients).
+        Identical for every fold, so inference runs it once and shares it."""
         m = self.backbone
         x = img.float().div_(255.0).unsqueeze(1)
         x = F.interpolate(x, size=(self.img_size, self.img_size), mode="bilinear",
@@ -102,6 +103,11 @@ class M2(nn.Module):
             x = m.norm_pre(x)
             for blk in m.blocks[:self.frozen_blocks]:
                 x = blk(x)
+        return x
+
+    def tail(self, x: torch.Tensor) -> torch.Tensor:
+        """stem tokens -> trained blocks -> standardised [N, 768 + g*g*384] (same as M1)."""
+        m = self.backbone
         for blk in m.blocks[self.frozen_blocks:]:
             x = blk(x)
         tok = m.norm(x).float()
@@ -114,13 +120,23 @@ class M2(nn.Module):
         g = (g - self.g_mean) / self.g_std
         return torch.cat([f, g.flatten(1)], 1)
 
-    def forward(self, vol: torch.Tensor, present: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        b, k, s, h, w = vol.shape
-        feats = self.slice_features(vol[present].reshape(-1, h, w))        # only real series
+    def slice_features(self, img: torch.Tensor) -> torch.Tensor:
+        return self.tail(self.stem(img))
+
+    def head_from_features(self, feats: torch.Tensor, present: torch.Tensor,
+                           pos: torch.Tensor) -> torch.Tensor:
+        """feats [n_present_series * S, F] in vol[present] order -> logits [B, 12]."""
+        b, k = present.shape
+        s = pos.shape[1]
         x = feats.new_zeros(b, k, s, feats.shape[-1])
         x[present] = feats.reshape(-1, s, feats.shape[-1])
         keep = present[:, :, None].expand(-1, -1, s)
         return self.head(x, keep, pos)
+
+    def forward(self, vol: torch.Tensor, present: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        b, k, s, h, w = vol.shape
+        feats = self.slice_features(vol[present].reshape(-1, h, w))        # only real series
+        return self.head_from_features(feats, present, pos)
 
 
 # ----------------------------------------------------------------------------- loops
