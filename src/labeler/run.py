@@ -17,7 +17,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import pandas as pd
@@ -76,6 +76,7 @@ def to_scores(findings) -> tuple[dict[str, float], list[str]]:
 
 def call_ollama(session: requests.Session, model: str, report: str,
                 timeout: float) -> dict:
+    # OPTIONS["num_ctx"] may be lowered by --num-ctx (see main)
     payload = {
         "model": model,
         "messages": [
@@ -121,6 +122,12 @@ def label_one(uid: str, report: str, model: str, timeout: float,
                        seconds=round(time.time() - t0, 2),
                        truncated=resp.get("done_reason") == "length")
             rec.pop("error", None)
+            used = (rec["prompt_tokens"] or 0) + (rec["eval_tokens"] or 0)
+            if used >= OPTIONS["num_ctx"] - 32:
+                rec["ctx_full"] = True
+                log.warning("%s: used %d of %d context tokens - the prompt may have "
+                            "been cut; rerun this study with a larger --num-ctx",
+                            uid, used, OPTIONS["num_ctx"])
             real = [pr for pr in problems if pr.startswith("unknown")]
             if real:  # empty-quote corrections are expected; don't log those
                 log.warning("%s: %s", uid, "; ".join(real))
@@ -157,6 +164,8 @@ def main() -> None:
     ap.add_argument("--redo", action="store_true", help="overwrite the output file")
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--tag", default="", help="extra suffix for the output name")
+    ap.add_argument("--num-ctx", type=int, default=OPTIONS["num_ctx"],
+                    help="context size; 6144 uses less GPU memory (default 8192)")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel requests; needs OLLAMA_NUM_PARALLEL set to the same")
     args = ap.parse_args()
@@ -201,29 +210,65 @@ def main() -> None:
     log.info("prompt=%s model=%s subset=%s: %d already done, %d to do -> %s",
              PROMPT_VERSION, args.model, args.subset, len(done), len(todo), out_path)
 
+    OPTIONS["num_ctx"] = args.num_ctx
+    log.info("num_ctx=%d", args.num_ctx)
     workers = max(1, args.workers)
     if workers > 1:
         log.info("workers=%d: Ollama must be started with OLLAMA_NUM_PARALLEL>=%d, "
                  "otherwise requests just queue", workers, workers)
     t_start, n_ok, n_fail = time.time(), 0, 0
     rows = list(todo[["StudyInstanceUID", "Report"]].itertuples(index=False, name=None))
-    with open(out_path, "a", encoding="utf-8") as out, \
-            ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(label_one, uid, rep, args.model, args.timeout, log)
-                   for uid, rep in rows]
-        for i, fut in enumerate(as_completed(futures), 1):
-            rec = fut.result()
-            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out.flush()
-            n_ok += rec["ok"]
-            n_fail += not rec["ok"]
-            if i % 25 == 0 or i == len(rows):
-                el = time.time() - t_start
-                eta = el / i * (len(rows) - i)
-                log.info("%d/%d  ok=%d fail=%d  %.1f s/report  ETA %.1f h",
-                         i, len(rows), n_ok, n_fail, el / i, eta / 3600)
+    results = iter_results(rows, workers, args.model, args.timeout, log)
+    i = 0
+    try:
+        with open(out_path, "a", encoding="utf-8") as out:
+            for i, rec in enumerate(results, 1):
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                out.flush()
+                n_ok += rec["ok"]
+                n_fail += not rec["ok"]
+                if i % 25 == 0 or i == len(rows):
+                    el = time.time() - t_start
+                    eta = el / i * (len(rows) - i)
+                    log.info("%d/%d  ok=%d fail=%d  %.1f s/report  ETA %.1f h",
+                             i, len(rows), n_ok, n_fail, el / i, eta / 3600)
+    except KeyboardInterrupt:
+        results.close()
+        log.info("stopped by Ctrl+C after %d new reports (all saved). "
+                 "Run the same command again to resume.", i)
+        return
     log.info("finished: ok=%d fail=%d (failed studies are retried on the next run)",
              n_ok, n_fail)
+
+
+def iter_results(rows, workers, model, timeout, log):
+    """Yield one record per report. Sequential for 1 worker; otherwise keeps at
+    most 2*workers requests in flight, so Ctrl+C stops promptly."""
+    if workers == 1:
+        for uid, rep in rows:
+            yield label_one(uid, rep, model, timeout, log)
+        return
+    pool = ThreadPoolExecutor(max_workers=workers)
+    pending = iter(rows)
+    inflight = set()
+
+    def submit_next():
+        nxt = next(pending, None)
+        if nxt is not None:
+            inflight.add(pool.submit(label_one, nxt[0], nxt[1], model, timeout, log))
+
+    try:
+        for _ in range(2 * workers):
+            submit_next()
+        while inflight:
+            done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                inflight.discard(fut)
+                yield fut.result()
+                submit_next()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
 
 if __name__ == "__main__":
     main()
