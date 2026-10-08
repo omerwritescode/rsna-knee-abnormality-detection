@@ -75,6 +75,43 @@ def build_cache(emb_dir: Path, g_out: int = 2) -> Path:
     return out
 
 
+def channel_stats(cache: dict, chunk: int = 64) -> dict[str, np.ndarray]:
+    """Per-channel mean / std over every present slice (no labels involved).
+
+    feats: 768 channels; grid: 384 channels shared by all grid cells. DINOv2 has a few
+    channels with very large values; standardising each channel stops them dominating.
+    """
+    feats, grid, present = cache["feats"], cache["grid"], cache["present"]
+    sums = {k: np.zeros(d, np.float64) for k, d in (("f", feats.shape[-1]), ("g", grid.shape[-1]))}
+    sq = {k: np.zeros_like(v) for k, v in sums.items()}
+    n = {"f": 0, "g": 0}
+    for s in range(0, len(feats), chunk):
+        m = present[s:s + chunk]
+        f = feats[s:s + chunk][m].astype(np.float64).reshape(-1, feats.shape[-1])
+        g = grid[s:s + chunk][m].astype(np.float64).reshape(-1, grid.shape[-1])
+        for key, a in (("f", f), ("g", g)):
+            sums[key] += a.sum(0)
+            sq[key] += (a * a).sum(0)
+            n[key] += len(a)
+    out = {}
+    for key in ("f", "g"):
+        mu = sums[key] / n[key]
+        sd = np.sqrt(np.maximum(sq[key] / n[key] - mu * mu, 1e-12))
+        out[f"{key}_mean"] = mu.astype(np.float32)
+        out[f"{key}_std"] = np.maximum(sd, 1e-3).astype(np.float32)
+    return out
+
+
+def load_stats(cache_dir: Path, cache: dict) -> dict[str, np.ndarray]:
+    path = cache_dir / "stats.npz"
+    if path.exists():
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+    stats = channel_stats(cache)
+    np.savez(path, **stats)
+    return stats
+
+
 def load_cache(cache_dir: Path, in_memory: bool = True) -> dict:
     mode = None if in_memory else "r"
     return dict(

@@ -47,7 +47,9 @@ def guess_language(text: str) -> str:
 
 
 def read_labels(path: Path) -> pd.DataFrame:
-    return pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path, dtype={"StudyInstanceUID": str})
 
 
 def load_patients(raw: Path) -> pd.Series | None:

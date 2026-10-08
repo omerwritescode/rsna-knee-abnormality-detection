@@ -12,6 +12,10 @@ slice's CLS + mean-patch feature (768) plus, by default, its 2x2 patch grid (153
 token = MLP(feature) + kind embedding + slice-position embedding
 -> 2-layer transformer -> 12 learned label queries attend over the tokens -> 12 logits.
 
+Inputs are standardised per channel (stats.npz in the cache dir, also saved in every
+checkpoint). A masked mean of the tokens is added to each label's attention output, so
+the model learns from the first epoch instead of waiting for the attention to focus.
+
 Training: BCE on soft labels (1 / 0.5 / 0), AdamW + cosine, and augmentation:
   * mirror the knee left<->right (p=0.5): coronal/axial use the flipped-image
     features, sagittal kinds get their slice order reversed;
@@ -33,7 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .data import KIND_SLOT, KIND_SLOT_MIRROR, N_SLICES, SAGITTAL, load_cache
+from .data import KIND_SLOT, KIND_SLOT_MIRROR, N_SLICES, SAGITTAL, load_cache, load_stats
 from .folds import read_labels
 from .metrics import LABELS, score
 
@@ -65,9 +69,11 @@ class M1(nn.Module):
         h = h.reshape(b, k * s, -1)
         pad = ~keep.reshape(b, k * s)
         h = self.enc(h, src_key_padding_mask=pad)
+        w = keep.reshape(b, k * s, 1).to(h.dtype)
+        h_mean = (h * w).sum(1) / w.sum(1).clamp(min=1.0)                # [B,d]
         q = self.queries[None].expand(b, -1, -1)
         o, _ = self.pool(q, h, h, key_padding_mask=pad)
-        o = self.norm(o)
+        o = self.norm(o + h_mean[:, None])     # mean path: learns fast; attention refines
         return (o * self.head_w).sum(-1) + self.head_b                 # [B,12]
 
 
@@ -75,7 +81,12 @@ class M1(nn.Module):
 class Features:
     """Holds the cache on the CPU and assembles batches (with optional mirroring)."""
 
-    def __init__(self, cache: dict, use_grid: bool):
+    def __init__(self, cache: dict, use_grid: bool, stats: dict):
+        self.stats = stats
+        self.f_mean = torch.from_numpy(stats["f_mean"])
+        self.f_std = torch.from_numpy(stats["f_std"])
+        self.g_mean = torch.from_numpy(stats["g_mean"])
+        self.g_std = torch.from_numpy(stats["g_std"])
         self.feats = torch.from_numpy(np.ascontiguousarray(cache["feats"]))
         self.grid = torch.from_numpy(np.ascontiguousarray(cache["grid"])) if use_grid else None
         self.present = torch.from_numpy(cache["present"])
@@ -89,9 +100,10 @@ class Features:
         """rows [B] cache rows, mirror [B] bool -> x [B,4,32,F] float32, present [B,4] bool."""
         slots = torch.where(mirror[:, None], self.slot_m[None], self.slot[None])   # [B,4]
         r = rows[:, None].expand(-1, N_KINDS)
-        x = self.feats[r, slots].float()
+        x = (self.feats[r, slots].float() - self.f_mean) / self.f_std
         if self.grid is not None:
-            x = torch.cat([x, self.grid[r, slots].float().flatten(-2)], -1)
+            g = (self.grid[r, slots].float() - self.g_mean) / self.g_std     # [B,4,32,c,384]
+            x = torch.cat([x, g.flatten(-2)], -1)
         present = self.present[r, slots]
         flip = (mirror[:, None] & self.sag[None])[:, :, None, None]
         x = torch.where(flip, x.flip(2), x)
@@ -186,9 +198,9 @@ def main() -> None:
     ap.add_argument("--name", default=None)
     ap.add_argument("--folds", default="0,1,2,3,4")
     ap.add_argument("--no-grid", action="store_true", help="use only CLS+mean features")
-    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--layers", type=int, default=2)
@@ -215,8 +227,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     labels = read_labels(args.root / "data" / "labels" / "soft_labels.parquet")
-    folds = pd.read_csv(args.root / "data" / "labels" / "folds.csv")
-    cache = load_cache(args.root / "data" / "embeddings" / args.tag / args.cache)
+    folds = pd.read_csv(args.root / "data" / "labels" / "folds.csv", dtype={"StudyInstanceUID": str})
+    cache_dir = args.root / "data" / "embeddings" / args.tag / args.cache
+    cache = load_cache(cache_dir)
+    stats = load_stats(cache_dir, cache)
     row_of = {u: i for i, u in enumerate(cache["uids"])}
     df = folds.merge(labels[["StudyInstanceUID", *LABELS]], on="StudyInstanceUID")
     df["row"] = df["StudyInstanceUID"].map(row_of)
@@ -227,7 +241,7 @@ def main() -> None:
     if args.smoke:
         df = df.groupby("fold").head(80).reset_index(drop=True)
 
-    feats = Features(cache, use_grid=not args.no_grid)
+    feats = Features(cache, use_grid=not args.no_grid, stats=stats)
     Y = torch.tensor(df[LABELS].to_numpy(), dtype=torch.float32)
     rows = torch.tensor(df["row"].astype(int).to_numpy())
     cfg = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
@@ -240,7 +254,9 @@ def main() -> None:
     for k in [int(f) for f in args.folds.split(",")]:
         pred, model = train_fold(k, df, Y, rows, feats, args, device, log)
         oof.loc[df.index[df["fold"] == k], LABELS] = pred
-        torch.save({"state_dict": model.state_dict(), "config": cfg}, out / f"fold{k}.pt")
+        torch.save({"state_dict": model.state_dict(), "config": cfg,
+                    "stats": {k2: torch.from_numpy(v) for k2, v in stats.items()}},
+                   out / f"fold{k}.pt")
 
     done = oof.notna().all(axis=1).to_numpy()
     res = df.loc[done, ["StudyInstanceUID", "fold", "source"]].join(oof.loc[done])
