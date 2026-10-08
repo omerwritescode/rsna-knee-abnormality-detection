@@ -26,6 +26,57 @@ SAGITTAL = np.array([True, False, False, True])      # mirrored by reversing sli
 N_SLICES, FEAT_DIM, PATCH_DIM = 32, 768, 384
 
 
+MIRROR_IMAGE = ~SAGITTAL           # mirror: coronal/axial flip the image, sagittal reverses slices
+SIZE = 256
+
+
+def augment_series(vol: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Same random affine + intensity change for every slice of one series (uint8 [S,H,W])."""
+    import cv2
+    s = rng.uniform(0.9, 1.1)
+    ang = rng.uniform(-10, 10)
+    tx, ty = rng.uniform(-0.06, 0.06, 2) * SIZE
+    m = cv2.getRotationMatrix2D((SIZE / 2, SIZE / 2), ang, s)
+    m[:, 2] += (tx, ty)
+    out = np.empty_like(vol)
+    for i in range(len(vol)):
+        out[i] = cv2.warpAffine(vol[i], m, (SIZE, SIZE), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    a, b = rng.uniform(0.85, 1.15), rng.uniform(-12, 12)
+    return np.clip(out.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
+
+
+def sample_study(arrays: dict, train: bool, rng: np.random.Generator | None = None,
+                 n_slices: int = 16, mirror: bool = False, p_mirror: float = 0.5,
+                 p_series: float = 0.2):
+    """kneeprep arrays -> (vol uint8 [4, S, 256, 256], present bool [4], positions int [S]).
+
+    train: every (32/S)-th slice with a random offset, random mirror, series dropout and
+    augmentation. eval: all 32 slices, mirrored only if `mirror`.
+    """
+    if train:
+        step = N_SLICES // n_slices
+        idx = rng.integers(0, step) + step * np.arange(n_slices)
+        mirror = rng.random() < p_mirror
+    else:
+        idx = np.arange(N_SLICES)
+    present = np.array([k in arrays for k in KINDS])
+    if train and p_series > 0 and present.sum() > 1:
+        drop = (rng.random(len(KINDS)) < p_series) & present
+        if (present & ~drop).any():
+            present &= ~drop
+    vol = np.zeros((len(KINDS), len(idx), SIZE, SIZE), np.uint8)
+    for k, kind in enumerate(KINDS):
+        if not present[k]:
+            continue
+        v = arrays[kind]
+        if mirror:
+            v = v[:, :, ::-1] if MIRROR_IMAGE[k] else v[::-1]
+        v = np.ascontiguousarray(v[idx])
+        vol[k] = augment_series(v, rng) if train else v
+    return vol, present, idx.astype(np.int64)
+
+
 def pool_grid(grid: np.ndarray, g_out: int) -> np.ndarray:
     """[S, G*G, D] (row-major G x G) -> [S, g_out*g_out, D] by block averaging."""
     s, n, d = grid.shape

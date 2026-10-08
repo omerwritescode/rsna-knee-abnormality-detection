@@ -62,10 +62,13 @@ class M1(nn.Module):
         self.head_w = nn.Parameter(torch.zeros(n_labels, d))
         self.head_b = nn.Parameter(torch.zeros(n_labels))
 
-    def forward(self, x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
-        """x [B, K, S, F] float; keep [B, K, S] bool (True = real token)."""
+    def forward(self, x: torch.Tensor, keep: torch.Tensor,
+                pos: torch.Tensor | None = None) -> torch.Tensor:
+        """x [B, K, S, F] float; keep [B, K, S] bool (True = real token);
+        pos [B, S] slice positions 0..31 (None = all 32 slices in order)."""
         b, k, s, _ = x.shape
-        h = self.inp(x) + self.kind[None] + self.pos[None]          # [B,K,S,d]
+        pos_emb = self.pos[None] if pos is None else self.pos[0][pos][:, None]   # [.,1,S,d]
+        h = self.inp(x) + self.kind[None] + pos_emb                   # [B,K,S,d]
         h = h.reshape(b, k * s, -1)
         pad = ~keep.reshape(b, k * s)
         h = self.enc(h, src_key_padding_mask=pad)
