@@ -82,7 +82,9 @@ for mod in ("pylibjpeg", "openjpeg", "libjpeg", "gdcm"):
         print("  decoder MISSING:", mod)"""
 
 CELL_DIRS = """for d in ("src/kneeprep", "src/models"):
-    os.makedirs(f"/kaggle/working/{d}", exist_ok=True)"""
+    os.makedirs(f"/kaggle/working/{d}", exist_ok=True)
+for f in EMPTY_FILES:              # empty package markers (%%writefile needs a body)
+    open(f"/kaggle/working/{f}", "w").close()"""
 
 CELL_RUN = """sys.path.insert(0, "/kaggle/working")
 from src.models.predict import run_test
@@ -105,14 +107,19 @@ def md(src: str) -> dict:
 
 
 def main() -> None:
-    cells = [md(MD_INTRO), code(CELL_CONFIG), code(CELL_FIND), code(CELL_INSTALL), code(CELL_DIRS),
-             md("## Source files (embedded from the repo)")]
+    file_cells, empty = [], []
     for rel in FILES:
         path = ROOT / rel
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
         if not path.exists() and not rel.endswith("__init__.py"):
             raise SystemExit(f"missing {rel}")
-        cells.append(code(f"%%writefile /kaggle/working/{rel}\n{text}"))
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if text.strip():
+            file_cells.append(code(f"%%writefile /kaggle/working/{rel}\n{text}"))
+        else:
+            empty.append(rel)
+    dirs_cell = f"EMPTY_FILES = {empty!r}\n" + CELL_DIRS
+    cells = [md(MD_INTRO), code(CELL_CONFIG), code(CELL_FIND), code(CELL_INSTALL), code(dirs_cell),
+             md("## Source files (embedded from the repo)"), *file_cells]
     cells += [md("## Predict the test set"), code(CELL_RUN)]
     nb = {"cells": cells,
           "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
