@@ -13,3 +13,5 @@ __pycache__/
 .kaggle/
 
 runs/
+
+kaggle/model_dataset/
