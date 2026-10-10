@@ -9,9 +9,10 @@ Local checks (laptop, before uploading anything):
 
 Kaggle (called from the submission notebook):
     run_test(data_root, model_dir, "/kaggle/working/submission.csv")
-  DICOM -> kneeprep (CPU worker pool) -> DINOv2 features (GPU) -> M1 fold ensemble with
-  mirror TTA -> submission.csv in sample_submission's row and column order. A study that
-  fails at any step gets the training prevalence instead, so the run never crashes.
+  DICOM -> kneeprep (CPU worker pool) -> M1 (frozen DINOv2 features + fold ensemble) and
+  one fold ensemble per M2 run (folders m2/ or m2_<run>/), all with mirror TTA -> weighted
+  average by blend.json -> submission.csv in sample_submission's row and column order.
+  A study that fails at any step gets the training prevalence, so the run never crashes.
 """
 from __future__ import annotations
 
@@ -160,6 +161,21 @@ def prep_task(task):
         return i, None, f"{type(e).__name__}: {e}"[:300]
 
 
+def blend_weights(model_dir: Path, groups: list[str], log=print) -> dict[str, float]:
+    """Weight per model folder ('m1', 'm2', 'm2_ft1', ...) from blend.json.
+    New format: {"weights": {folder: w}}; old format: {"m1": w, "m2": w}."""
+    f = next(model_dir.rglob("blend.json"), None)
+    raw = json.loads(f.read_text()) if f else {}
+    w = raw.get("weights", {k: raw[k] for k in ("m1", "m2") if k in raw})
+    if not w:
+        log("WARNING: no blend.json - equal weights for every model folder")
+        w = {g: 1.0 for g in groups}
+    missing = [k for k, v in w.items() if v > 0 and k not in groups]
+    if missing:
+        log(f"WARNING: blend.json gives weight to {missing}, which are not in the dataset")
+    return {g: float(w.get(g, 0.0)) for g in groups}
+
+
 def run_test(data_root, model_dir, out_csv, workers: int | None = None,
              time_limit_h: float = 8.0, split: str = "test", log=print) -> "pd.DataFrame":
     import multiprocessing as mp
@@ -187,32 +203,34 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
     if weights is None:
         log("WARNING: no model.safetensors in the model dataset - timm will try to download")
     weights = str(weights) if weights else None
-    ckpts = list(model_dir.rglob("fold*.pt"))
-    m1_paths = [p for p in ckpts if p.parent.name == "m1"]
-    m2_paths = [p for p in ckpts if p.parent.name == "m2"]
-    blend_file = next(model_dir.rglob("blend.json"), None)
-    w = json.loads(blend_file.read_text()) if blend_file else {"m1": 0.3, "m2": 0.7}
-    use_m1 = bool(m1_paths) and w.get("m1", 0) > 0
-    use_m2 = bool(m2_paths) and w.get("m2", 0) > 0
-    if not (use_m1 or use_m2):
-        raise FileNotFoundError(f"no usable checkpoints (m1: {len(m1_paths)}, m2: {len(m2_paths)})")
-    embedder = ens = m2ens = None
+    paths: dict[str, list] = {}                     # model folder -> fold checkpoints
+    for p in model_dir.rglob("fold*.pt"):
+        if p.parent.name == "m1" or p.parent.name.startswith("m2"):
+            paths.setdefault(p.parent.name, []).append(p)
+    w = blend_weights(model_dir, sorted(paths), log)
+    use = {g: ps for g, ps in sorted(paths.items()) if w[g] > 0}
+    if not use:
+        raise FileNotFoundError(f"no usable checkpoints: {({g: len(v) for g, v in paths.items()})}, "
+                                f"weights {w}")
+    use_m1 = "m1" in use
+    m2_groups = [g for g in use if g != "m1"]
+    embedder = ens = None
     g_out = 2
     if use_m1:
         embedder = Embedder(weights=weights)
-        ens = Ensemble(m1_paths, embedder.device)
+        ens = Ensemble(use["m1"], embedder.device)
         g_out = int(ens.cfg.get("cache", "cache_g2").split("_g")[-1])
-    if use_m2:
-        m2ens = M2Ensemble(m2_paths, weights)
-    log(f"models ready: M1 {len(m1_paths) if use_m1 else 0} folds (w={w.get('m1', 0) if use_m1 else 0}), "
-        f"M2 {len(m2_paths) if use_m2 else 0} folds (w={w.get('m2', 0) if use_m2 else 0}"
-        f"{', shared frozen stem' if use_m2 and m2ens.shared else ''}) ({time.time() - t0:.0f}s)")
+    m2ens = {g: M2Ensemble(use[g], weights) for g in m2_groups}
+    for g in use:
+        extra = f", frozen stem shared by its folds: {m2ens[g].shared}" if g in m2ens else ""
+        log(f"  {g}: {len(use[g])} folds, weight {w[g]}{extra}")
+    log(f"models ready ({time.time() - t0:.0f}s)")
 
     n = len(ids)
     feats = np.zeros((n, N_SLOTS, N_SLICES, FEAT_DIM), np.float16)
     grid = np.zeros((n, N_SLOTS, N_SLICES, g_out * g_out, PATCH_DIM), np.float16)
     present = np.zeros((n, N_SLOTS), bool)
-    pred_m2 = np.full((n, len(LABELS)), np.nan)
+    pred = {g: np.full((n, len(LABELS)), np.nan) for g in use}
     problems, timed_out = {}, False
     for k, (i, arrays, msg) in enumerate(results, 1):
         if msg:
@@ -222,13 +240,13 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
                 feats[i], grid[i], present[i] = study_tensors(arrays, embedder, g_out)
             except Exception as e:  # noqa: BLE001
                 problems[ids[i]] = f"M1 {type(e).__name__}: {e}"[:300]
-        if arrays and use_m2:
+        for g in (m2_groups if arrays else []):
             try:
-                p2 = m2ens.predict_arrays(arrays)
+                p2 = m2ens[g].predict_arrays(arrays)
                 if p2 is not None:
-                    pred_m2[i] = p2
+                    pred[g][i] = p2
             except Exception as e:  # noqa: BLE001
-                problems[ids[i]] = f"M2 {type(e).__name__}: {e}"[:300]
+                problems[ids[i]] = f"{g} {type(e).__name__}: {e}"[:300]
         el = time.time() - t0
         if k % 50 == 0 or k == n:
             log(f"  {k}/{n} studies  {el / k:.2f} s/study  elapsed {el / 60:.1f} min  "
@@ -239,22 +257,20 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
             break
     pool.terminate()
 
-    pred_m1 = np.full((n, len(LABELS)), np.nan)
     ok1 = present.any(1)
     if use_m1 and ok1.any():
-        pred_m1[ok1] = ens.predict(feats[ok1], grid[ok1], present[ok1])
+        pred["m1"][ok1] = ens.predict(feats[ok1], grid[ok1], present[ok1])
+    # weighted average over the models that produced a prediction for each study
     num = np.zeros((n, len(LABELS)))
     den = np.zeros(n)
-    for p_, wt, used in ((pred_m1, w.get("m1", 0), use_m1), (pred_m2, w.get("m2", 0), use_m2)):
-        if not used:
-            continue
+    for g, p_ in pred.items():
         valid = ~np.isnan(p_).any(1)
-        num[valid] += wt * p_[valid]
-        den[valid] += wt
+        num[valid] += w[g] * p_[valid]
+        den[valid] += w[g]
     ok = den > 0
-    pred = np.tile(np.array([priors[lab] for lab in LABELS], float), (n, 1))
-    pred[ok] = num[ok] / den[ok, None]
-    sub = pd.DataFrame(pred, columns=LABELS)
+    final = np.tile(np.array([priors[lab] for lab in LABELS], float), (n, 1))
+    final[ok] = num[ok] / den[ok, None]
+    sub = pd.DataFrame(final, columns=LABELS)
     sub.insert(0, "StudyInstanceUID", ids)
     sub = sub[sample.columns.tolist()]
     sub.to_csv(out_csv, index=False)
@@ -263,8 +279,8 @@ def run_test(data_root, model_dir, out_csv, workers: int | None = None,
         f"{' (time limit)' if timed_out else ''} | total {(time.time() - t0) / 60:.1f} min")
     if use_m1:
         log("M1 series kinds present: " + str(dict(zip(SLOTS, present.sum(0).tolist()))))
-    if use_m2:
-        log(f"M2 predicted {int((~np.isnan(pred_m2).any(1)).sum())} studies")
+    for g in m2_groups:
+        log(f"{g} predicted {int((~np.isnan(pred[g]).any(1)).sum())} studies")
     for sid, msg in list(problems.items())[:20]:
         log(f"  note {sid[-12:]}: {msg}")
     if len(problems) > 20:

@@ -1,11 +1,13 @@
 """Collect everything the internet-off submission notebook needs into one Kaggle dataset.
 
-    python scripts/make_model_dataset.py --run v2                 # M1 only
-    python scripts/make_model_dataset.py --run v2 --m2-run ft1    # M1 + M2 (+ blend.json)
+    python -m src.models.blend --m2 ft1,ft2        # first: writes runs/blend.json
+    python scripts/make_model_dataset.py           # packs the runs blend.json gives weight to
+    python scripts/make_model_dataset.py --run v2  # M1 only (no blend file needed)
 
 Creates kaggle/model_dataset/ with
-    m1/fold*.pt (+ config.json, metrics.csv)   the M1 run's fold checkpoints
-    m2/fold*.pt (+ blend.json)                 the M2 run's fold checkpoints (optional)
+    blend.json                                  the weights (keys = folder names below)
+    m1/fold*.pt (+ config.json, metrics.csv)    the M1 run's folds, if its weight > 0
+    m2_<run>/fold*.pt (+ config.json)           each M2 run with weight > 0
     dinov2/model.safetensors                   DINOv2-S weights (from the local HF cache)
     priors.json                                per-label prevalence, used if a study fails
     wheels/                                    pydicom + JPEG/JPEG2000 decoders for Linux
@@ -49,10 +51,24 @@ def download_wheels(dest: Path, py: str) -> bool:
     return True
 
 
+def copy_run(src_dir: Path, dst: Path, extra=("config.json", "metrics.csv")) -> int:
+    folds = sorted(src_dir.glob("fold*.pt"))
+    if not folds:
+        raise SystemExit(f"no fold*.pt in {src_dir}")
+    dst.mkdir(parents=True)
+    for f in [*folds, *(src_dir / e for e in extra)]:
+        if f.exists():
+            shutil.copy2(f, dst / f.name)
+    if len(folds) < 5:
+        print(f"WARNING: only {len(folds)} folds in {src_dir}")
+    return len(folds)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", default="v2", help="runs/m1/<run>")
-    ap.add_argument("--m2-run", default=None, help="runs/m2/<run> (optional)")
+    ap.add_argument("--blend", type=Path, default=ROOT / "runs" / "blend.json",
+                    help="from src.models.blend; decides which runs are included")
+    ap.add_argument("--run", default=None, help="M1 only: runs/m1/<run>, ignores --blend")
     ap.add_argument("--out", type=Path, default=ROOT / "kaggle" / "model_dataset")
     ap.add_argument("--user", default="omerraza2202")
     ap.add_argument("--slug", default="rsna-knee-models")
@@ -60,40 +76,32 @@ def main() -> None:
     ap.add_argument("--skip-wheels", action="store_true")
     args = ap.parse_args()
 
-    run_dir = ROOT / "runs" / "m1" / args.run
-    folds = sorted(run_dir.glob("fold*.pt"))
-    if not folds:
-        raise SystemExit(f"no fold*.pt in {run_dir}")
-    out = args.out
-    (out / "m1").mkdir(parents=True, exist_ok=True)
-    for old in (out / "m1").glob("*"):
-        old.unlink()
-    for f in [*folds, run_dir / "config.json", run_dir / "metrics.csv"]:
-        if f.exists():
-            shutil.copy2(f, out / "m1" / f.name)
-    print(f"M1 run '{args.run}': {len(folds)} folds copied")
+    if args.run:
+        blend = {"weights": {"m1": 1.0}, "runs": {"m1": args.run}}
+    else:
+        if not args.blend.exists():
+            raise SystemExit(f"{args.blend} not found - run python -m src.models.blend first")
+        blend = json.loads(args.blend.read_text())
+        if "weights" not in blend:
+            raise SystemExit(f"{args.blend} is in the old format - rerun python -m src.models.blend")
 
-    m2_dir = out / "m2"
-    if m2_dir.exists():
-        for old in m2_dir.glob("*"):
-            old.unlink()
-    if args.m2_run:
-        run2 = ROOT / "runs" / "m2" / args.m2_run
-        folds2 = sorted(run2.glob("fold*.pt"))
-        if not folds2:
-            raise SystemExit(f"no fold*.pt in {run2}")
-        m2_dir.mkdir(exist_ok=True)
-        for f in [*folds2, run2 / "config.json", run2 / "blend.json"]:
-            if f.exists():
-                shutil.copy2(f, m2_dir / f.name)
-        blend = json.loads((run2 / "blend.json").read_text()) if (run2 / "blend.json").exists() \
-            else {"m1": 0.3, "m2": 0.7}
-        if not (run2 / "blend.json").exists():
-            (m2_dir / "blend.json").write_text(json.dumps(blend, indent=2))
-            print("WARNING: no blend.json from src.models.blend - using M1 0.3 / M2 0.7")
-        print(f"M2 run '{args.m2_run}': {len(folds2)} folds copied, blend {blend}")
-        if len(folds2) < 5:
-            print(f"WARNING: only {len(folds2)} M2 folds")
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    for old in [*out.glob("m1"), *out.glob("m2*")]:          # models from the previous version
+        shutil.rmtree(old)
+    for old in out.glob("blend.json"):
+        old.unlink()
+
+    used = {k: w for k, w in blend["weights"].items() if w > 0}
+    for key, w in used.items():
+        run = blend["runs"][key]
+        src_dir = ROOT / "runs" / ("m1" if key == "m1" else "m2") / run
+        n = copy_run(src_dir, out / key)
+        print(f"{key:10s} <- {src_dir.relative_to(ROOT)}  ({n} folds, weight {w})")
+    dropped = [k for k, w in blend["weights"].items() if w <= 0]
+    if dropped:
+        print(f"weight 0, left out: {', '.join(dropped)}")
+    (out / "blend.json").write_text(json.dumps({**blend, "weights": used}, indent=2))
 
     (out / "dinov2").mkdir(exist_ok=True)
     src = dinov2_weights()
