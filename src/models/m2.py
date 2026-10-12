@@ -3,19 +3,23 @@
     python -m src.models.m2 --smoke                      # tiny pipeline check (~2 min)
     python -m src.models.m2 --folds 0 --name ft1         # one fold first: compare with M1 v2
     python -m src.models.m2 --name ft1                   # all 5 folds (overnight)
+    python -m src.models.m2 --name ft2 --collect         # score all oof_fold*.csv of a run
 
 Starts from the M1 v2 checkpoint of the SAME fold (head + feature standardisation), so
 fold k begins at M1's validation score and fine-tuning should only add to it.
 
 Per training step, each study contributes 4 series x 16 slices (every 2nd slice, random
 offset) read straight from data/shards; the first `--frozen-blocks` ViT blocks run
-without gradients, the rest are trained (bf16 autocast). Augmentation per series:
+without gradients, the rest are trained (autocast: bf16 where the GPU supports it, else
+fp16 with gradient scaling, e.g. on a Kaggle T4; `--amp` overrides). Augmentation per series:
 small random scale/shift/rotation, brightness/contrast, and the left<->right knee mirror
 (coronal/axial images flipped, sagittal slice order reversed). Whole-series dropout.
 Validation: all 32 slices, normal + mirrored view averaged (same TTA as M1).
 
 Outputs: runs/m2/<name>/fold{k}.pt (backbone + head + stats), oof_fold{k}.csv,
-metrics.csv (when folds finish), config.json, train.log.
+metrics.csv (when folds finish), config.json, train.log. When only some folds run (e.g. one
+process per GPU on Kaggle), the log and metrics get a suffix (train_f3.log, metrics_f3.csv)
+so parallel runs don't overwrite each other; `--collect` then scores all folds together.
 """
 from __future__ import annotations
 
@@ -140,14 +144,27 @@ class M2(nn.Module):
 
 
 # ----------------------------------------------------------------------------- loops
+def amp_dtype(choice: str, device) -> torch.dtype:
+    """auto: bf16 if the GPU has it natively (RTX 30xx+), else fp16 (T4, P100)."""
+    if choice == "bf16":
+        return torch.bfloat16
+    if choice == "fp16" or device.type != "cuda":
+        return torch.float16
+    try:
+        ok = torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:                                   # older torch: no emulation flag
+        ok = torch.cuda.get_device_capability()[0] >= 8
+    return torch.bfloat16 if ok else torch.float16
+
+
 def run_eval(model: M2, ds_plain: StudyDataset, ds_mirror: StudyDataset, device,
-             workers: int) -> np.ndarray:
+             workers: int, dtype: torch.dtype = torch.bfloat16) -> np.ndarray:
     model.eval()
     preds = []
     for ds in (ds_plain, ds_mirror):
         out = []
         dl = DataLoader(ds, batch_size=1, num_workers=workers, pin_memory=True)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
+        with torch.no_grad(), torch.autocast("cuda", dtype=dtype,
                                              enabled=device.type == "cuda"):
             for vol, present, pos, _ in dl:
                 logit = model(vol.to(device, non_blocking=True), present.to(device),
@@ -194,9 +211,14 @@ def train_fold(k, df, Y, args, device, log, out_dir):
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda st: lr_lambda(st, total, max(1, steps_per_epoch // 2)))
     src = df["source"].to_numpy()
+    dtype = amp_dtype(args.amp, device)
+    # fp16 needs loss scaling (small gradients underflow); bf16 does not
+    scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16 and device.type == "cuda")
+    log.info("fold %d: autocast %s%s", k, str(dtype).replace("torch.", ""),
+             " + GradScaler" if scaler.is_enabled() else "")
 
     if args.eval_start:
-        p = run_eval(model, ds_va, ds_vm, device, args.workers)
+        p = run_eval(model, ds_va, ds_vm, device, args.workers, dtype)
         sc = score(p, Y[va], src[va])
         log.info("fold %d start (= M1 head)  val auc_llm %.4f  auc_human %.3f", k,
                  sc.loc["MACRO", "auc_llm"], sc.loc["MACRO", "auc_human"])
@@ -209,16 +231,18 @@ def train_fold(k, df, Y, args, device, log, out_dir):
         opt.zero_grad(set_to_none=True)
         for it, (vol, present, pos, y) in enumerate(dl_tr, 1):
             vol, present = vol.to(device, non_blocking=True), present.to(device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast("cuda", dtype=dtype, enabled=device.type == "cuda"):
                 logit = model(vol, present, pos.to(device))
             loss = F.binary_cross_entropy_with_logits(logit.float(), y.to(device))
-            (loss / args.accum).backward()
+            scaler.scale(loss / args.accum).backward()
             run_loss += loss.item() * len(y)
             n_seen += len(y)
             n_img += int(present.sum()) * vol.shape[2]
             if it % args.accum == 0:
+                scaler.unscale_(opt)                    # no-op when the scaler is disabled
                 nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-                opt.step()
+                scaler.step(opt)                        # skipped if fp16 gradients overflowed
+                scaler.update()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
             if it % args.log_every == 0:
@@ -228,7 +252,7 @@ def train_fold(k, df, Y, args, device, log, out_dir):
                          el / it * (len(dl_tr) - it) / 60)
         msg = f"fold {k} ep {ep}  loss {run_loss / max(n_seen, 1):.4f}  ({(time.time() - t0) / 60:.1f} min)"
         if ep % args.eval_every == 0 or ep == args.epochs:
-            p = run_eval(model, ds_va, ds_vm, device, args.workers)
+            p = run_eval(model, ds_va, ds_vm, device, args.workers, dtype)
             sc = score(p, Y[va], src[va])
             msg += (f"  val auc_llm {sc.loc['MACRO', 'auc_llm']:.4f}  "
                     f"auc_human {sc.loc['MACRO', 'auc_human']:.3f}")
@@ -244,6 +268,23 @@ def train_fold(k, df, Y, args, device, log, out_dir):
 
 def vars_str(args) -> dict:
     return {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+
+
+def collect(out_dir: Path, labels: pd.DataFrame, log) -> None:
+    """Score every oof_fold*.csv of a run together (after folds ran in separate processes)."""
+    parts = sorted(out_dir.glob("oof_fold*.csv"))
+    if not parts:
+        raise SystemExit(f"no oof_fold*.csv in {out_dir}")
+    oof = pd.concat([pd.read_csv(p, dtype={"StudyInstanceUID": str}) for p in parts])
+    df = labels[["StudyInstanceUID", "source", *LABELS]].merge(
+        oof, on="StudyInstanceUID", suffixes=("", "_p"))
+    sc = score(df[[f"{l}_p" for l in LABELS]].to_numpy(), df[LABELS].to_numpy(),
+               df["source"].to_numpy())
+    sc.to_csv(out_dir / "metrics.csv")
+    folds = ",".join(p.stem.replace("oof_fold", "") for p in parts)
+    with pd.option_context("display.float_format", "{:.4f}".format):
+        log.info("\nOOF scores (%d studies, folds %s):\n%s", len(df), folds, sc.to_string())
+    log.info("saved -> %s", out_dir / "metrics.csv")
 
 
 def main() -> None:
@@ -271,23 +312,36 @@ def main() -> None:
                     help="score the untouched start (should match M1 v2 on this fold)")
     ap.add_argument("--log-every", type=int, default=200)
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16"],
+                    help="autocast precision; auto = bf16 if native, else fp16 + GradScaler")
+    ap.add_argument("--collect", action="store_true",
+                    help="only score all oof_fold*.csv in runs/m2/<name> -> metrics.csv")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.smoke:
         args.name, args.folds, args.epochs, args.slices = args.name or "smoke", "0", 1, 8
         args.eval_every, args.log_every, args.accum = 1, 5, 2
 
+    if args.collect and not args.name:
+        raise SystemExit("--collect needs --name")
     name = args.name or time.strftime("%Y%m%d_%H%M")
     out_dir = args.root / "runs" / "m2" / name
     out_dir.mkdir(parents=True, exist_ok=True)
+    fold_list = [int(f) for f in args.folds.split(",")]
+    # a subset of folds (e.g. one process per GPU) gets its own log / metrics file
+    sfx = "" if args.collect or sorted(fold_list) == [0, 1, 2, 3, 4] else \
+        "_f" + "".join(str(f) for f in fold_list)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
-                        handlers=[logging.FileHandler(out_dir / "train.log", encoding="utf-8"),
+                        handlers=[logging.FileHandler(out_dir / f"train{sfx}.log", encoding="utf-8"),
                                   logging.StreamHandler()], force=True)
     log = logging.getLogger("m2")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    (out_dir / "config.json").write_text(json.dumps(vars_str(args), indent=2))
-
     labels = read_labels(args.root / "data" / "labels" / "soft_labels.parquet")
+    if args.collect:
+        collect(out_dir, labels, log)
+        return
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    (out_dir / f"config{sfx}.json").write_text(json.dumps(vars_str(args), indent=2))
+
     folds = pd.read_csv(args.root / "data" / "labels" / "folds.csv",
                         dtype={"StudyInstanceUID": str})
     df = folds.merge(labels[["StudyInstanceUID", *LABELS]], on="StudyInstanceUID")
@@ -300,12 +354,12 @@ def main() -> None:
     log.info("M2 %s: %d studies, device %s, torch %s", name, len(df), device, torch.__version__)
 
     oof = np.full(Y.shape, np.nan)
-    for k in [int(f) for f in args.folds.split(",")]:
+    for k in fold_list:
         va, p = train_fold(k, df, Y, args, device, log, out_dir)
         oof[va] = p
     done = ~np.isnan(oof).any(1)
     sc = score(oof[done], Y[done], df["source"].to_numpy()[done])
-    sc.to_csv(out_dir / "metrics.csv")
+    sc.to_csv(out_dir / f"metrics{sfx}.csv")
     with pd.option_context("display.float_format", "{:.4f}".format):
         log.info("\nOOF scores (%d studies, folds %s):\n%s", done.sum(), args.folds, sc.to_string())
     log.info("saved -> %s", out_dir)
