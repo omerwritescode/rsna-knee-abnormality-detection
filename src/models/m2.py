@@ -4,6 +4,11 @@
     python -m src.models.m2 --folds 0 --name ft1         # one fold first: compare with M1 v2
     python -m src.models.m2 --name ft1                   # all 5 folds (overnight)
     python -m src.models.m2 --name ft2 --collect         # score all oof_fold*.csv of a run
+    python -m src.models.m2 --name pl --train-labels pseudo_pl1.parquet   # other TRAINING targets
+
+`--train-labels` (a file in data/labels, same columns as soft_labels.parquet, e.g. pseudo-labels)
+replaces only the training targets; validation, OOF scores and metrics are always against
+soft_labels.parquet, so the numbers stay comparable with every other run.
 
 Starts from the M1 v2 checkpoint of the SAME fold (head + feature standardisation), so
 fold k begins at M1's validation score and fine-tuning should only add to it.
@@ -174,7 +179,7 @@ def run_eval(model: M2, ds_plain: StudyDataset, ds_mirror: StudyDataset, device,
     return np.mean(preds, 0)
 
 
-def train_fold(k, df, Y, args, device, log, out_dir):
+def train_fold(k, df, Y, args, device, log, out_dir, Yt=None):
     tr = np.flatnonzero(df["fold"].to_numpy() != k)
     va = np.flatnonzero(df["fold"].to_numpy() == k)
     uids = df["StudyInstanceUID"].to_numpy()
@@ -199,7 +204,8 @@ def train_fold(k, df, Y, args, device, log, out_dir):
     hd = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("head")]
     opt = torch.optim.AdamW([{"params": bb, "lr": args.lr_backbone},
                              {"params": hd, "lr": args.lr_head}], weight_decay=args.wd)
-    ds_tr = StudyDataset(shard_dir, uids[tr], Y[tr], True, args.slices, seed=args.seed + k,
+    Yt = Y if Yt is None else Yt                       # training targets (pseudo-labels or Y)
+    ds_tr = StudyDataset(shard_dir, uids[tr], Yt[tr], True, args.slices, seed=args.seed + k,
                          p_series=args.p_series)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True, num_workers=args.workers,
                        pin_memory=True, drop_last=True)
@@ -292,6 +298,9 @@ def main() -> None:
     ap.add_argument("--root", type=Path, default=Path("."))
     ap.add_argument("--name", default=None)
     ap.add_argument("--init", default="v2", help="M1 run to initialise the head from")
+    ap.add_argument("--train-labels", default=None,
+                    help="training targets from this file in data/labels (validation still "
+                         "uses soft_labels.parquet)")
     ap.add_argument("--folds", default="0,1,2,3,4")
     ap.add_argument("--backbone", default="vit_small_patch14_dinov2.lvd142m")
     ap.add_argument("--weights", default=None, help="local DINOv2 weights file (optional)")
@@ -352,10 +361,24 @@ def main() -> None:
                        ignore_index=True)
     Y = df[LABELS].to_numpy().astype(np.float32)
     log.info("M2 %s: %d studies, device %s, torch %s", name, len(df), device, torch.__version__)
+    Yt = None
+    if args.train_labels:
+        tl = Path(args.train_labels)
+        tl = tl if tl.exists() else args.root / "data" / "labels" / tl
+        pl = read_labels(tl).drop_duplicates("StudyInstanceUID").set_index("StudyInstanceUID")
+        miss = ~df["StudyInstanceUID"].isin(pl.index)
+        if miss.any():
+            raise SystemExit(f"{tl.name}: {int(miss.sum())} training studies have no targets")
+        Yt = pl.loc[df["StudyInstanceUID"], LABELS].to_numpy().astype(np.float32)
+        if not np.isfinite(Yt).all() or Yt.min() < 0 or Yt.max() > 1:
+            raise SystemExit(f"{tl.name}: targets must be finite and within [0, 1]")
+        log.info("training targets from %s (validation still vs soft_labels.parquet): "
+                 "mean |change| %.3f, per label %s", tl.name, float(np.abs(Yt - Y).mean()),
+                 ", ".join(f"{l} {d:.3f}" for l, d in zip(LABELS, np.abs(Yt - Y).mean(0))))
 
     oof = np.full(Y.shape, np.nan)
     for k in fold_list:
-        va, p = train_fold(k, df, Y, args, device, log, out_dir)
+        va, p = train_fold(k, df, Y, args, device, log, out_dir, Yt)
         oof[va] = p
     done = ~np.isnan(oof).any(1)
     sc = score(oof[done], Y[done], df["source"].to_numpy()[done])
